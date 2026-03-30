@@ -1,5 +1,8 @@
+import { CheckCircleOutlined } from '@ant-design/icons'
 import CodeViewer from '@renderer/components/CodeViewer'
 import { useCodeStyle } from '@renderer/context/CodeStyleProvider'
+import type { DiagnosisResult } from '@renderer/services/ErrorDiagnosisService'
+import { diagnoseError } from '@renderer/services/ErrorDiagnosisService'
 import type { SerializedAiSdkError, SerializedAiSdkErrorUnion, SerializedError } from '@renderer/types/error'
 import {
   isSerializedAiSdkAPICallError,
@@ -27,10 +30,11 @@ import {
 } from '@renderer/types/error'
 import { formatAiSdkError, formatError, safeToString } from '@renderer/utils/error'
 import { parseDataUrl } from '@shared/utils'
-import { Button } from 'antd'
+import { Button, Spin } from 'antd'
 import { Modal } from 'antd'
 import React, { memo, useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { Link } from 'react-router-dom'
 import styled from 'styled-components'
 
 interface ErrorDetailModalProps {
@@ -497,10 +501,68 @@ const AiSdkError = memo(({ error }: { error: SerializedAiSdkErrorUnion }) => {
   )
 })
 
+// --- AI Diagnosis Panel ---
+
+const DiagnosisPanel = styled.div`
+  margin-top: 16px;
+  padding: 14px 16px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 185, 107, 0.15);
+  background: rgba(0, 185, 107, 0.03);
+`
+
+const DiagnosisHeader = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-primary, #00b96b);
+  margin-bottom: 10px;
+`
+
+const DiagnosisBody = styled.div`
+  font-size: 13px;
+  color: var(--color-text-secondary, rgba(0, 0, 0, 0.65));
+  line-height: 1.7;
+`
+
+const DiagnosisSteps = styled.div`
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+`
+
+const StepItem = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(0, 185, 107, 0.04);
+`
+
+const StepNumber = styled.span`
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--color-primary, #00b96b);
+  color: #fff;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-weight: 700;
+`
+
 // --- Main Component ---
 
 const ErrorDetailModal: React.FC<ErrorDetailModalProps> = ({ open, onClose, error }) => {
   const { t } = useTranslation()
+  const [diagStatus, setDiagStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle')
 
   const copyErrorDetails = useCallback(() => {
     if (!error) return
@@ -529,6 +591,24 @@ const ErrorDetailModal: React.FC<ErrorDetailModalProps> = ({ open, onClose, erro
     )
   }
 
+  // Reset diagnosis state when modal opens/closes or error changes
+  useEffect(() => {
+    if (!open) {
+      setDiagStatus('idle')
+    }
+  }, [open, error])
+
+  const getDiagButtonText = () => {
+    switch (diagStatus) {
+      case 'loading':
+        return t('error.diagnosis.ai_loading') + '...'
+      case 'done':
+        return t('error.diagnosis.ai_done')
+      default:
+        return t('error.diagnosis.ai_button')
+    }
+  }
+
   return (
     <Modal
       centered
@@ -536,6 +616,19 @@ const ErrorDetailModal: React.FC<ErrorDetailModalProps> = ({ open, onClose, erro
       open={open}
       onCancel={onClose}
       footer={[
+        <Button
+          key="diagnose"
+          variant="text"
+          color="default"
+          disabled={diagStatus === 'loading'}
+          style={diagStatus === 'done' ? { color: 'var(--color-primary, #00b96b)' } : undefined}
+          onClick={() => {
+            if (diagStatus !== 'loading') {
+              setDiagStatus('loading')
+            }
+          }}>
+          {getDiagButtonText()}
+        </Button>,
         <Button key="copy" variant="text" color="default" onClick={copyErrorDetails}>
           {t('common.copy')}
         </Button>,
@@ -545,10 +638,110 @@ const ErrorDetailModal: React.FC<ErrorDetailModalProps> = ({ open, onClose, erro
       ]}
       width="80%"
       style={{ maxWidth: '1200px', minWidth: '600px' }}>
-      <ErrorDetailContainer>{renderErrorDetails(error)}</ErrorDetailContainer>
+      <ErrorDetailContainer>
+        {renderErrorDetails(error)}
+        {diagStatus !== 'idle' && (
+          <AIDiagnosisSectionWithStatus error={error} status={diagStatus} onStatusChange={setDiagStatus} />
+        )}
+      </ErrorDetailContainer>
     </Modal>
   )
 }
+
+const AIDiagnosisSectionWithStatus = memo(
+  ({
+    error,
+    status,
+    onStatusChange
+  }: {
+    error?: SerializedError
+    status: 'idle' | 'loading' | 'done' | 'error'
+    onStatusChange: (status: 'idle' | 'loading' | 'done' | 'error') => void
+  }) => {
+    const { t, i18n } = useTranslation()
+    const [result, setResult] = useState<DiagnosisResult | null>(null)
+    const [diagError, setDiagError] = useState<string>('')
+    const hasStarted = useRef(false)
+
+    const runDiagnosis = useCallback(async () => {
+      if (!error) return
+      onStatusChange('loading')
+      setDiagError('')
+      try {
+        const diagnosis = await diagnoseError(error, i18n.language)
+        setResult(diagnosis)
+        onStatusChange('done')
+      } catch (err: any) {
+        setDiagError(err?.message || 'Diagnosis failed')
+        onStatusChange('error')
+      }
+    }, [error, i18n.language, onStatusChange])
+
+    useEffect(() => {
+      if (status === 'loading' && !hasStarted.current) {
+        hasStarted.current = true
+        void runDiagnosis()
+      }
+    }, [status, runDiagnosis])
+
+    return (
+      <DiagnosisPanel>
+        {status === 'loading' && (
+          <DiagnosisHeader>
+            <Spin size="small" />
+            {t('error.diagnosis.ai_loading')}...
+          </DiagnosisHeader>
+        )}
+        {status === 'error' && (
+          <>
+            <DiagnosisHeader style={{ color: 'var(--color-error, #ff4d4f)' }}>{diagError}</DiagnosisHeader>
+            <Button
+              size="small"
+              onClick={() => {
+                hasStarted.current = false
+                onStatusChange('loading')
+              }}>
+              {t('common.retry')}
+            </Button>
+          </>
+        )}
+        {status === 'done' && result && (
+          <>
+            <DiagnosisHeader>
+              <CheckCircleOutlined />
+              {t('error.diagnosis.ai_result')}
+            </DiagnosisHeader>
+            <DiagnosisBody>{result.summary}</DiagnosisBody>
+            {result.steps.length > 0 && (
+              <DiagnosisSteps>
+                {result.steps.map((step, i) => (
+                  <StepItem key={i}>
+                    <StepNumber>{i + 1}</StepNumber>
+                    {step.link ? (
+                      <a
+                        href={step.link}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ color: 'var(--color-primary, #00b96b)' }}>
+                        {step.text} ↗
+                      </a>
+                    ) : step.nav ? (
+                      <Link to={step.nav} style={{ color: 'var(--color-primary, #00b96b)' }}>
+                        → {step.text}
+                      </Link>
+                    ) : (
+                      <span>{step.text}</span>
+                    )}
+                  </StepItem>
+                ))}
+              </DiagnosisSteps>
+            )}
+          </>
+        )}
+      </DiagnosisPanel>
+    )
+  }
+)
 
 export { ErrorDetailModal }
 export default ErrorDetailModal
